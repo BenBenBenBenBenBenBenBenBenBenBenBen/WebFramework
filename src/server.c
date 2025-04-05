@@ -2,10 +2,73 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 
 #define PORT 8888
 #define HTML "templates/index.html"
 #define CSS "static/style.css"
+
+typedef struct {
+    const char* key;
+    const char* value;
+} TemplateVar;
+
+size_t htmlSize;
+
+const char* lookup(const char* key, TemplateVar* vars, size_t var_count) {
+    for (size_t i = 0; i < var_count; i++) {
+        if (strcmp(vars[i].key, key) == 0) {
+            return vars[i].value;
+        }
+    }
+    return ""; // default to empty string if key not found
+}
+
+char* render_template(const char* template, TemplateVar* vars, size_t var_count) {
+    size_t result_size = htmlSize + 1;
+    char* result = malloc(result_size);
+    result[0] = '\0';
+
+    const char* p = template;
+    while (*p) {
+        const char* start = strstr(p, "{{");
+        if (!start) {
+            strcat(result, p); // no more placeholders
+            break;
+        }
+
+        // Append text before {{
+        strncat(result, p, start - p);
+
+        const char* end = strstr(start, "}}");
+        if (!end) break; // malformed template
+
+        // Extract key
+        size_t key_len = end - (start + 2);
+        char key[256] = {0}; // assuming key length < 256
+        strncpy(key, start + 2, key_len);
+
+        // Look up replacement
+        const char* replacement = lookup(key, vars, var_count);
+
+        // Resize result buffer if needed
+        htmlSize = strlen(result) + strlen(replacement) + strlen(end + 2) + 1;
+        if (htmlSize > result_size) {
+            result_size = htmlSize * 2;
+            result = realloc(result, result_size);
+        }
+
+
+
+        strcat(result, replacement);
+
+        p = end + 2; // move past }}
+    }
+
+    result[htmlSize - 1] = '\0';
+
+    return result;
+}
 
 static enum MHD_Result send_response(struct MHD_Connection *connection, const char *mime, const char *filename) {
     FILE *file = fopen(filename, "rb");
@@ -13,19 +76,25 @@ static enum MHD_Result send_response(struct MHD_Connection *connection, const ch
         return MHD_NO;
 
     fseek(file, 0, SEEK_END);
-    size_t size = ftell(file);
+    htmlSize = ftell(file);
     rewind(file);
 
-    char *data = malloc(size);
+    char *data = malloc(htmlSize);
     if (!data) {
         fclose(file);
         return MHD_NO;
     }
 
-    fread(data, 1, size, file);
+    fread(data, 1, htmlSize, file);
     fclose(file);
+    
+    TemplateVar vars[] = {{"title", "Hello World!"}};
 
-    struct MHD_Response *response = MHD_create_response_from_buffer(size, data, MHD_RESPMEM_MUST_FREE);
+    char* rendered_template = render_template(data, vars, 1);
+    
+    printf("%s\n", rendered_template);
+
+    struct MHD_Response *response = MHD_create_response_from_buffer(htmlSize, rendered_template, MHD_RESPMEM_MUST_FREE);
     MHD_add_response_header(response, "Content-Type", mime);
     enum MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
     MHD_destroy_response(response);
@@ -48,7 +117,6 @@ static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *co
     if (strncmp(url, "/static/", 8) == 0) {
         char path[256];
         snprintf(path, sizeof(path), ".%s", url);  // becomes ./static/...
-
         // Guess MIME type
         const char *ext = strrchr(url, '.');
         const char *mime = "text/plain";
