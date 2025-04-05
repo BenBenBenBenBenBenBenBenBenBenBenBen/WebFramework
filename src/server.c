@@ -58,8 +58,6 @@ char* render_template(const char* template, TemplateVar* vars, size_t var_count)
             result = realloc(result, result_size);
         }
 
-
-
         strcat(result, replacement);
 
         p = end + 2; // move past }}
@@ -91,8 +89,6 @@ static enum MHD_Result send_response(struct MHD_Connection *connection, const ch
     TemplateVar vars[] = {{"title", "Hello World!"}};
 
     char* rendered_template = render_template(data, vars, 1);
-    
-    printf("%s\n", rendered_template);
 
     struct MHD_Response *response = MHD_create_response_from_buffer(htmlSize, rendered_template, MHD_RESPMEM_MUST_FREE);
     MHD_add_response_header(response, "Content-Type", mime);
