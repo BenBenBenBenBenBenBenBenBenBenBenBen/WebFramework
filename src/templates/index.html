@@ -6,6 +6,18 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+    <form method="POST" action="/submit">
+        <!-- Input for adding a new username -->
+        <input name="users.username_add" placeholder="Username">
+  
+        <!-- Input for adding a new email -->
+        <input name="users.email_add" placeholder="Email">
+  
+        <!-- Input for removing a user by ID -->
+        <input name="users.id_remove" placeholder="User ID" type="number">
+  
+        <button type="submit">Submit</button>
+    </form>
     <header><img src="" alt="Header Image"></header>
     <h1>{{title}}</h1>
     <h2>{{subtitle}}</h2>

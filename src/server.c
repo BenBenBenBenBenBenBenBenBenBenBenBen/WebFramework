@@ -1,12 +1,15 @@
-#include <microhttpd.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <pthread.h>
 
 #define PORT 8888
 #define HTML "templates/index.html"
-#define CSS "static/style.css"
 
 typedef struct {
     const char* key;
@@ -33,25 +36,21 @@ char* render_template(const char* template, TemplateVar* vars, size_t var_count)
     while (*p) {
         const char* start = strstr(p, "{{");
         if (!start) {
-            strcat(result, p); // no more placeholders
+            strcat(result, p);
             break;
         }
 
-        // Append text before {{
         strncat(result, p, start - p);
 
         const char* end = strstr(start, "}}");
-        if (!end) break; // malformed template
+        if (!end) break;
 
-        // Extract key
         size_t key_len = end - (start + 2);
-        char key[256] = {0}; // assuming key length < 256
+        char key[256] = {0};
         strncpy(key, start + 2, key_len);
 
-        // Look up replacement
         const char* replacement = lookup(key, vars, var_count);
 
-        // Resize result buffer if needed
         htmlSize = strlen(result) + strlen(replacement) + strlen(end + 2) + 1;
         if (htmlSize > result_size) {
             result_size = htmlSize * 2;
@@ -59,107 +58,214 @@ char* render_template(const char* template, TemplateVar* vars, size_t var_count)
         }
 
         strcat(result, replacement);
-
-        p = end + 2; // move past }}
+        p = end + 2;
     }
 
     result[htmlSize - 1] = '\0';
-
     return result;
 }
 
-static enum MHD_Result send_response(struct MHD_Connection *connection, const char *mime, const char *filename) {
+const char* get_mime_type(const char* path) {
+    const char* ext = strrchr(path, '.');
+    if (!ext) return "text/plain";
+    if (strcmp(ext, ".html") == 0) return "text/html";
+    if (strcmp(ext, ".css") == 0) return "text/css";
+    if (strcmp(ext, ".js") == 0) return "application/javascript";
+    if (strcmp(ext, ".png") == 0) return "image/png";
+    if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(ext, ".svg") == 0) return "image/svg+xml";
+    if (strcmp(ext, ".woff") == 0) return "font/woff";
+    if (strcmp(ext, ".woff2") == 0) return "font/woff2";
+    return "text/plain";
+}
+
+void send_response(int client_fd, const char *mime, const char *filename, int is_template) {
     FILE *file = fopen(filename, "rb");
-    if (!file)
-        return MHD_NO;
+    if (!file) {
+        const char *msg = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
+        send(client_fd, msg, strlen(msg), 0);
+        return;
+    }
 
     fseek(file, 0, SEEK_END);
     htmlSize = ftell(file);
     rewind(file);
 
-    char *data = malloc(htmlSize);
-    if (!data) {
-        fclose(file);
-        return MHD_NO;
+    char *data = malloc(htmlSize + 1);
+    fread(data, 1, htmlSize, file);
+    data[htmlSize] = '\0';
+    fclose(file);
+
+    char* output = data;
+
+    if (is_template) {
+        TemplateVar vars[] = {{"title", "Hello!"}};
+        output = render_template(data, vars, 1);
+        free(data);
+        htmlSize = strlen(output);
     }
 
-    fread(data, 1, htmlSize, file);
-    fclose(file);
-    
-    TemplateVar vars[] = {{"title", "Hello World!"}};
+    dprintf(client_fd, 
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n", 
+        mime, htmlSize);
+    send(client_fd, output, htmlSize, 0);
 
-    char* rendered_template = render_template(data, vars, 1);
-
-    struct MHD_Response *response = MHD_create_response_from_buffer(htmlSize, rendered_template, MHD_RESPMEM_MUST_FREE);
-    MHD_add_response_header(response, "Content-Type", mime);
-    enum MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-    MHD_destroy_response(response);
-    return ret;
+    if (is_template) free(output);
+    else free(data);
 }
 
-static enum MHD_Result answer_to_connection(void *cls, struct MHD_Connection *connection,
-                                            const char *url, const char *method,
-                                            const char *version, const char *upload_data,
-                                            size_t *upload_data_size, void **con_cls) {
-    if (strcmp(method, "GET") != 0)
-        return MHD_NO;
+void answer_to_connection(int client_fd, const char *url, const char *method) {
+    if (strcmp(method, "GET") != 0) {
+        const char *msg = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+        send(client_fd, msg, strlen(msg), 0);
+        return;
+    }
 
-    // Serve root page
     if (strcmp(url, "/") == 0) {
-        return send_response(connection, "text/html", "templates/index.html");
-    }
-
-    // Serve static files (e.g., /static/style.css)
-    if (strncmp(url, "/static/", 8) == 0) {
+        send_response(client_fd, "text/html", "templates/index.html", 1);
+    } else if (strncmp(url, "/static/", 8) == 0) {
         char path[256];
-        snprintf(path, sizeof(path), ".%s", url);  // becomes ./static/...
-        // Guess MIME type
-        const char *ext = strrchr(url, '.');
-        const char *mime = "text/plain";
-
-        if (ext) {
-            if (strcmp(ext, ".css") == 0) mime = "text/css";
-            else if (strcmp(ext, ".js") == 0) mime = "application/javascript";
-            else if (strcmp(ext, ".png") == 0) mime = "image/png";
-            else if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) mime = "image/jpeg";
-            else if (strcmp(ext, ".svg") == 0) mime = "image/svg+xml";
-            else if (strcmp(ext, ".woff") == 0) mime = "font/woff";
-            else if (strcmp(ext, ".woff2") == 0) mime = "font/woff2";
-            else if (strcmp(ext, ".html") == 0) mime = "text/html";
-        }
-
-        return send_response(connection, mime, path);
-    }
-
-    // Serve HTML pages from templates/ (e.g., /about.html → templates/about.html)
-    if (strstr(url, ".html") != NULL) {
+        snprintf(path, sizeof(path), ".%s", url);
+        send_response(client_fd, get_mime_type(path), path, 0);
+    } else if (strstr(url, ".html") != NULL) {
         char path[256];
         snprintf(path, sizeof(path), "templates%s", url);
-        return send_response(connection, "text/html", path);
+        send_response(client_fd, "text/html", path, 1);
+    } else {
+        const char *msg = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found";
+        send(client_fd, msg, strlen(msg), 0);
+    }
+}
+
+// Parse field names from the form and extract table, column, and action
+void parse_field_name(const char* field_name) {
+    // Find the action: "_add" or "_remove"
+    char* action;
+    char* actionPtr = strstr(field_name, "_add");
+    if (!actionPtr) {
+        actionPtr = strstr(field_name, "_remove");
+        action = "remove";
+    } else {
+        action = "add";
     }
 
-    // Not found
-    const char *not_found = "404 Not Found";
-    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(not_found),
-                                                                    (void *)not_found,
-                                                                    MHD_RESPMEM_PERSISTENT);
-    enum MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_NOT_FOUND, response);
-    MHD_destroy_response(response);
-    return ret;
+    if (actionPtr) {
+        *actionPtr = '\0';
+        // Extract table and column from the field name
+        char* table = strtok((char*)field_name, ".");
+        char* column = strtok(NULL, ".");
+
+        // Determine the action type
+        if (strcmp(action, "add") == 0) {
+            printf("Action: Add, Table: %s, Column: %s\n", table, column);
+        } else {
+            printf("Action: Remove, Table: %s, Column: %s\n", table, column);
+        }
+    }
+}
+
+// Process POST request form data
+void process_form_data(char* body) {
+    char* field_start = body;
+    while (field_start) {
+        // Find the next field separator (assuming the body is in key=value&key=value format)
+        char* field_end = strchr(field_start, '&');
+        if (field_end) {
+            *field_end = '\0'; // Null-terminate at the & symbol
+        }
+
+        // Extract the field name
+        char* field_name = strtok(field_start, "=");
+
+        // Process the field name to determine the action, table, and column
+        parse_field_name(field_name);
+
+        // Move to the next field
+        field_start = field_end ? field_end + 1 : NULL;
+    }
+}
+
+// Handle POST request and form data
+void handle_post_request(int client_fd, const char* body) {
+    if (body) {
+        process_form_data((char*)body);
+    }
+}
+
+// Thread function to handle each client request
+void* handle_client(void* arg) {
+    int client_fd = *((int*)arg);
+    free(arg);
+
+    char buffer[2048] = {0};
+    read(client_fd, buffer, sizeof(buffer) - 1);
+
+    char method[8], url[1024];
+    sscanf(buffer, "%s %s", method, url);
+
+    if (strcmp(method, "POST") == 0) {
+        char* body = strstr(buffer, "\r\n\r\n");
+        if (body) {
+            body += 4; // Skip past the headers
+            handle_post_request(client_fd, body);
+        }
+    } else {
+        answer_to_connection(client_fd, url, method);
+    }
+
+    close(client_fd);
+    return NULL;
 }
 
 int main() {
-    struct MHD_Daemon *daemon;
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        exit(1);
+    }
 
-    daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, PORT, NULL, NULL,
-                              &answer_to_connection, NULL, MHD_OPTION_END);
-    if (NULL == daemon)
-        return 1;
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(PORT),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        exit(1);
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        close(server_fd);
+        exit(1);
+    }
 
     printf("Server running on http://localhost:%d\n", PORT);
-    getchar();  // Wait for user to press Enter
 
-    MHD_stop_daemon(daemon);
+    while (1) {
+        int* client_fd = malloc(sizeof(int));
+        *client_fd = accept(server_fd, NULL, NULL);
+        if (*client_fd < 0) {
+            free(client_fd);
+            continue;
+        }
+
+        // Create a new thread for each client
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, handle_client, client_fd) != 0) {
+            perror("pthread_create");
+            close(*client_fd);
+            free(client_fd);
+        } else {
+            pthread_detach(thread); // Detach thread to handle cleanup automatically
+        }
+    }
+
+    close(server_fd);
     return 0;
 }
-
