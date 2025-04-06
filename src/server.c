@@ -185,31 +185,49 @@ void process_form_data(char* body) {
     }
 }
 
-// Handle POST request and form data
-void handle_post_request(int client_fd, const char* body) {
+// Handle POST request and form data (stay on the same page)
+void handle_post_request(int client_fd, const char* body, const char* url) {
     if (body) {
-        process_form_data((char*)body);
+        process_form_data((char*)body);  // Process the form data (store it, update DB, etc.)
     }
+
+    // Send a redirect to the same page (URL)
+    // The Location header tells the browser to reload the same page
+    char response[1024];
+    snprintf(response, sizeof(response),
+             "HTTP/1.1 302 Found\r\n"
+             "Location: %s\r\n"
+             "Content-Length: 0\r\n"
+             "\r\n", url);
+
+    send(client_fd, response, strlen(response), 0);
 }
 
-// Thread function to handle each client request
 void* handle_client(void* arg) {
     int client_fd = *((int*)arg);
     free(arg);
 
     char buffer[2048] = {0};
-    read(client_fd, buffer, sizeof(buffer) - 1);
+    ssize_t bytes_received = read(client_fd, buffer, sizeof(buffer) - 1);
+
+    if (bytes_received < 0) {
+        perror("Failed to read request");
+        close(client_fd);
+        return NULL;
+    }
 
     char method[8], url[1024];
     sscanf(buffer, "%s %s", method, url);
 
+    // Handle POST requests
     if (strcmp(method, "POST") == 0) {
         char* body = strstr(buffer, "\r\n\r\n");
         if (body) {
             body += 4; // Skip past the headers
-            handle_post_request(client_fd, body);
+            handle_post_request(client_fd, body, url);  // Pass the URL to the post handler
         }
     } else {
+        // Handle other requests (GET requests)
         answer_to_connection(client_fd, url, method);
     }
 
