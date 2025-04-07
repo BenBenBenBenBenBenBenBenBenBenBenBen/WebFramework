@@ -219,7 +219,7 @@ void* handle_client(void* arg) {
     int client_fd = *((int*)arg);
     free(arg);
 
-    lua_State* L = init_lua();  // Don't close it immediately!
+    lua_State* L = init_lua();
 
     char buffer[2048] = {0};
     ssize_t bytes_received = read(client_fd, buffer, sizeof(buffer) - 1);
