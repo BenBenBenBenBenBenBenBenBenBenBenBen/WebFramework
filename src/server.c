@@ -7,16 +7,40 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
 
 #define PORT 8888
 #define HTML "templates/index.html"
+#define Lua "templates/template.lua"
 
 typedef struct {
     const char* key;
     const char* value;
 } TemplateVar;
 
+typedef struct {
+    int length;
+    TemplateVar *pairs;
+} TemplateList;
+
 size_t htmlSize;
+
+TemplateList templateList;
+
+int update_template_data(lua_State* L);
+
+lua_State* init_lua();
+
+int receive_kv(lua_State *L) {
+    const char *key = luaL_checkstring(L, 1);
+    const char *value = luaL_checkstring(L, 2);
+
+    printf("Received key: %s, value: %s\n", key, value);
+
+    return 0;
+}
 
 const char* lookup(const char* key, TemplateVar* vars, size_t var_count) {
     for (size_t i = 0; i < var_count; i++) {
@@ -24,11 +48,11 @@ const char* lookup(const char* key, TemplateVar* vars, size_t var_count) {
             return vars[i].value;
         }
     }
-    return ""; // default to empty string if key not found
+    return "";
 }
 
 char* render_template(const char* template, TemplateVar* vars, size_t var_count) {
-    size_t result_size = htmlSize + 1;
+    size_t result_size = strlen(template) * 2 + 1;
     char* result = malloc(result_size);
     result[0] = '\0';
 
@@ -48,12 +72,13 @@ char* render_template(const char* template, TemplateVar* vars, size_t var_count)
         size_t key_len = end - (start + 2);
         char key[256] = {0};
         strncpy(key, start + 2, key_len);
+        key[key_len] = '\0';
 
         const char* replacement = lookup(key, vars, var_count);
 
-        htmlSize = strlen(result) + strlen(replacement) + strlen(end + 2) + 1;
-        if (htmlSize > result_size) {
-            result_size = htmlSize * 2;
+        size_t needed_size = strlen(result) + strlen(replacement) + strlen(end + 2) + 1;
+        if (needed_size > result_size) {
+            result_size = needed_size * 2;
             result = realloc(result, result_size);
         }
 
@@ -61,7 +86,6 @@ char* render_template(const char* template, TemplateVar* vars, size_t var_count)
         p = end + 2;
     }
 
-    result[htmlSize - 1] = '\0';
     return result;
 }
 
@@ -99,8 +123,7 @@ void send_response(int client_fd, const char *mime, const char *filename, int is
     char* output = data;
 
     if (is_template) {
-        TemplateVar vars[] = {{"title", "Hello!"}};
-        output = render_template(data, vars, 1);
+        output = render_template(data, templateList.pairs, templateList.length);
         free(data);
         htmlSize = strlen(output);
     }
@@ -121,6 +144,7 @@ void answer_to_connection(int client_fd, const char *url, const char *method) {
         return;
     }
 
+
     if (strcmp(url, "/") == 0) {
         send_response(client_fd, "text/html", "templates/index.html", 1);
     } else if (strncmp(url, "/static/", 8) == 0) {
@@ -137,9 +161,7 @@ void answer_to_connection(int client_fd, const char *url, const char *method) {
     }
 }
 
-// Parse field names from the form and extract table, column, and action
 void parse_field_name(const char* field_name) {
-    // Find the action: "_add" or "_remove"
     char* action;
     char* actionPtr = strstr(field_name, "_add");
     if (!actionPtr) {
@@ -151,11 +173,10 @@ void parse_field_name(const char* field_name) {
 
     if (actionPtr) {
         *actionPtr = '\0';
-        // Extract table and column from the field name
+
         char* table = strtok((char*)field_name, ".");
         char* column = strtok(NULL, ".");
 
-        // Determine the action type
         if (strcmp(action, "add") == 0) {
             printf("Action: Add, Table: %s, Column: %s\n", table, column);
         } else {
@@ -164,42 +185,33 @@ void parse_field_name(const char* field_name) {
     }
 }
 
-// Process POST request form data
 void process_form_data(char* body) {
     char* field_start = body;
     while (field_start) {
-        // Find the next field separator (assuming the body is in key=value&key=value format)
         char* field_end = strchr(field_start, '&');
         if (field_end) {
-            *field_end = '\0'; // Null-terminate at the & symbol
+            *field_end = '\0';
         }
-
-        // Extract the field name
         char* field_name = strtok(field_start, "=");
 
-        // Process the field name to determine the action, table, and column
         parse_field_name(field_name);
 
-        // Move to the next field
         field_start = field_end ? field_end + 1 : NULL;
     }
 }
 
-// Handle POST request and form data (stay on the same page)
 void handle_post_request(int client_fd, const char* body, const char* url) {
     if (body) {
-        process_form_data((char*)body);  // Process the form data (store it, update DB, etc.)
+        process_form_data((char*)body);
     }
 
-    // Send a redirect to the same page (URL)
-    // The Location header tells the browser to reload the same page
     char response[1024];
     snprintf(response, sizeof(response),
              "HTTP/1.1 302 Found\r\n"
              "Location: %s\r\n"
              "Content-Length: 0\r\n"
              "\r\n", url);
-
+    
     send(client_fd, response, strlen(response), 0);
 }
 
@@ -207,32 +219,87 @@ void* handle_client(void* arg) {
     int client_fd = *((int*)arg);
     free(arg);
 
+    lua_State* L = init_lua();  // Don't close it immediately!
+
     char buffer[2048] = {0};
     ssize_t bytes_received = read(client_fd, buffer, sizeof(buffer) - 1);
 
     if (bytes_received < 0) {
         perror("Failed to read request");
         close(client_fd);
+        lua_close(L);
         return NULL;
     }
 
     char method[8], url[1024];
     sscanf(buffer, "%s %s", method, url);
 
-    // Handle POST requests
     if (strcmp(method, "POST") == 0) {
         char* body = strstr(buffer, "\r\n\r\n");
         if (body) {
-            body += 4; // Skip past the headers
-            handle_post_request(client_fd, body, url);  // Pass the URL to the post handler
+            body += 4;
+            handle_post_request(client_fd, body, url);
         }
     } else {
-        // Handle other requests (GET requests)
         answer_to_connection(client_fd, url, method);
     }
 
+    lua_close(L);
     close(client_fd);
     return NULL;
+}
+
+void free_template_list() {
+    for (int i = 0; i < templateList.length; ++i) {
+        free((char*)templateList.pairs[i].key);
+        free((char*)templateList.pairs[i].value);
+    }
+    free(templateList.pairs);
+    templateList.length = 0;
+    templateList.pairs = NULL;
+}
+
+int update_template_data(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    free_template_list();
+
+    int count = 0;
+    lua_pushnil(L);
+    while (lua_next(L, 1) != 0) {
+        count++;
+        lua_pop(L, 1);
+    }
+
+    templateList.length = count;
+    templateList.pairs = malloc(sizeof(TemplateVar) * count);
+
+    lua_pushnil(L);
+    int index = 0;
+    while (lua_next(L, 1) != 0) {
+        const char* key = lua_tostring(L, -2);
+        const char* value = lua_tostring(L, -1);
+
+        templateList.pairs[index].key = strdup(key);
+        templateList.pairs[index].value = strdup(value);
+
+        lua_pop(L, 1);
+        index++;
+    }
+
+    return 0;
+}
+
+lua_State* init_lua(){
+    lua_State* L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_register(L, "send_kv_list", update_template_data);
+
+    if (luaL_dofile(L, Lua)) {
+        fprintf(stderr, "Lua error: %s\n", lua_tostring(L, -1));
+    }
+    return L;
 }
 
 int main() {
