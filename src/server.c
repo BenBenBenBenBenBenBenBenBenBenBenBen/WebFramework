@@ -10,10 +10,11 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <sqlite3.h>
 
 #define PORT 8888
 #define HTML "templates/index.html"
-#define Lua "templates/template.lua"
+#define LUA "templates/template.lua"
 
 typedef struct {
     const char* key;
@@ -22,10 +23,22 @@ typedef struct {
 
 typedef struct {
     int length;
-    TemplateVar *pairs;
+    TemplateVar* pairs;
 } TemplateList;
 
+typedef struct {
+    const char* col;
+    const char* data;
+} ColData;
+
+typedef struct {
+    char* tbl;    
+    int length;
+    ColData* colData;
+} DataList;
+
 size_t htmlSize;
+const char* DATABASE;
 
 TemplateList templateList;
 
@@ -33,13 +46,9 @@ int update_template_data(lua_State* L);
 
 lua_State* init_lua();
 
-int receive_kv(lua_State *L) {
-    const char *key = luaL_checkstring(L, 1);
-    const char *value = luaL_checkstring(L, 2);
-
-    printf("Received key: %s, value: %s\n", key, value);
-
-    return 0;
+int receive_database_name(lua_State* L){
+   DATABASE = luaL_checkstring(L, 1);
+   return 0;
 }
 
 const char* lookup(const char* key, TemplateVar* vars, size_t var_count) {
@@ -173,7 +182,6 @@ void parse_field_name(const char* field_name) {
 
     if (actionPtr) {
         *actionPtr = '\0';
-
         char* table = strtok((char*)field_name, ".");
         char* column = strtok(NULL, ".");
 
@@ -186,18 +194,32 @@ void parse_field_name(const char* field_name) {
 }
 
 void process_form_data(char* body) {
+    DataList* data = malloc(strlen(body) + sizeof(int));
+    //char action[10];
     char* field_start = body;
     while (field_start) {
-        char* field_end = strchr(field_start, '&');
-        if (field_end) {
+        char* field_end = strchr(field_start, '.');
+        *field_end = '\0';
+        if(strcmp(field_start, "col") == 0) {
+            field_start = field_end + 1;
+            field_end = strchr(field_start, '=');
             *field_end = '\0';
+        } else if(strcmp(field_start, "tbl") == 0) {
+            field_start = field_end + 1;            
+            field_end = strchr(field_start, '=');
+            *field_end = '\0';
+            data->tbl = field_start;
         }
-        char* field_name = strtok(field_start, "=");
 
-        parse_field_name(field_name);
+        printf("%s\n", field_start);
+        field_start = field_end + 1;
+        field_end = strchr(field_start, '&');
+        if(field_end) *field_end = '\0';
+        printf("%s\n", field_start);
 
         field_start = field_end ? field_end + 1 : NULL;
     }
+    free(data);
 }
 
 void handle_post_request(int client_fd, const char* body, const char* url) {
@@ -236,6 +258,7 @@ void* handle_client(void* arg) {
 
     if (strcmp(method, "POST") == 0) {
         char* body = strstr(buffer, "\r\n\r\n");
+        printf("%s\n", buffer);
         if (body) {
             body += 4;
             handle_post_request(client_fd, body, url);
@@ -296,18 +319,30 @@ lua_State* init_lua(){
 
     lua_register(L, "send_kv_list", update_template_data);
 
-    if (luaL_dofile(L, Lua)) {
+    if (luaL_dofile(L, LUA)) {
         fprintf(stderr, "Lua error: %s\n", lua_tostring(L, -1));
     }
     return L;
 }
 
 int main() {
+    lua_State* L = luaL_newstate();
+    luaL_openlibs(L);
+
+    lua_register(L, "send_database_name", receive_database_name);
+
+    if (luaL_dofile(L, LUA)) {
+        fprintf(stderr, "Lua error: %s\n", lua_tostring(L, -1));
+    }
+
+    lua_close(L);
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
         exit(1);
     }
+
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
