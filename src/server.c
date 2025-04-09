@@ -11,6 +11,7 @@
 #include <lauxlib.h>
 #include <lualib.h>
 #include <sqlite3.h>
+#include <ctype.h>
 
 #define PORT 8888
 #define HTML "templates/index.html"
@@ -27,14 +28,15 @@ typedef struct {
 } TemplateList;
 
 typedef struct {
-    const char* col;
-    const char* data;
+    char* col;
+    char* data;
 } ColData;
 
 typedef struct {
     char* tbl;    
     int length;
     ColData* colData;
+    char* action;
 } DataList;
 
 size_t htmlSize;
@@ -170,61 +172,139 @@ void answer_to_connection(int client_fd, const char *url, const char *method) {
     }
 }
 
-void parse_field_name(const char* field_name) {
-    char* action;
-    char* actionPtr = strstr(field_name, "_add");
-    if (!actionPtr) {
-        actionPtr = strstr(field_name, "_remove");
-        action = "remove";
-    } else {
-        action = "add";
+int send_to_database(sqlite3* db, DataList* data){
+    sqlite3_stmt *stmt;
+    char placeholders[265] = {0};
+    char columns[256] = {0};
+
+    for (int i = 0; i < data->length; i++) {
+        strcat(columns, data->colData[i].col);
+        strcat(placeholders, "?");
+
+        if (i < data->length - 1) {
+            strcat(columns, ", ");
+            strcat(placeholders, ", ");
+        }
     }
 
-    if (actionPtr) {
-        *actionPtr = '\0';
-        char* table = strtok((char*)field_name, ".");
-        char* column = strtok(NULL, ".");
+    char sql[512];
+    snprintf(sql, sizeof(sql), "INSERT INTO %s (%s) VALUES (%s);", data->tbl, columns, placeholders);
+    printf("%s\n", sql);
 
-        if (strcmp(action, "add") == 0) {
-            printf("Action: Add, Table: %s, Column: %s\n", table, column);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    for(int i = 0; i < data->length; i++){
+        sqlite3_bind_text(stmt, i + 1, data->colData[i].data, -1, SQLITE_STATIC);
+    }
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        fprintf(stderr, "Failed to execute statement: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    sqlite3_finalize(stmt);
+
+    return 0;
+}
+
+int count_col_fields(const char* body) {
+    int count = 0;
+    const char* ptr = body;
+    while ((ptr = strstr(ptr, "col.")) != NULL) {
+        // Ensure it's a full field key like col.something=
+        const char* equals = strchr(ptr, '=');
+        const char* amp = strchr(ptr, '&');
+        if (equals && (amp == NULL || equals < amp)) {
+            count++;
+        }
+        ptr = ptr + 4; // move past "col."
+    }
+    return count;
+}
+
+char from_hex(char ch) {
+    return isdigit(ch) ? ch - '0' : tolower(ch) - 'a' + 10;
+}
+
+void url_decode(char *str) {
+    char *p = str;
+    while (*str) {
+        if (*str == '%') {
+            if (str[1] && str[2]) {
+                *p++ = from_hex(str[1]) << 4 | from_hex(str[2]);
+                str += 2;
+            }
+        } else if (*str == '+') {
+            *p++ = ' ';
         } else {
-            printf("Action: Remove, Table: %s, Column: %s\n", table, column);
+            *p++ = *str;
         }
+        str++;
     }
+    *p = '\0';
 }
 
-void process_form_data(char* body) {
-    DataList* data = malloc(strlen(body) + sizeof(int));
-    //char action[10];
-    char* field_start = body;
-    while (field_start) {
-        char* field_end = strchr(field_start, '.');
-        *field_end = '\0';
-        if(strcmp(field_start, "col") == 0) {
-            field_start = field_end + 1;
-            field_end = strchr(field_start, '=');
-            *field_end = '\0';
-        } else if(strcmp(field_start, "tbl") == 0) {
-            field_start = field_end + 1;            
-            field_end = strchr(field_start, '=');
-            *field_end = '\0';
-            data->tbl = field_start;
+void process_form_data(const char* body, sqlite3 *db) {
+    char* input = strdup(body);  // Safe for multithreading
+    if (!input) return;
+
+    int col_count = count_col_fields(body);
+
+    printf("%d\n", col_count);
+
+    DataList* data = malloc(sizeof(DataList));
+    data->colData = malloc(sizeof(ColData) * col_count);
+    data->length = 0;
+    data->tbl = NULL;
+    data->action = NULL;
+
+    char* saveptr1;
+    char* pair = strtok_r(input, "&", &saveptr1);
+    while (pair != NULL) {
+        char* saveptr2;
+        char* key = strtok_r(pair, "=", &saveptr2);
+        char* value = strtok_r(NULL, "=", &saveptr2);
+        if (key && value) {
+            url_decode(key);
+            url_decode(value);
+
+            if (strncmp(key, "col.", 4) == 0) {
+                data->colData[data->length].col = strdup(key + 4);
+                data->colData[data->length].data = strdup(value);
+                printf("col: %s = %s\n", data->colData[data->length].col, data->colData[data->length].data);
+                data->length++;
+            } else if (strncmp(key, "tbl.", 4) == 0) {
+                data->tbl = strdup(key + 4);
+                data->action = strdup(value);
+            }
         }
-
-        printf("%s\n", field_start);
-        field_start = field_end + 1;
-        field_end = strchr(field_start, '&');
-        if(field_end) *field_end = '\0';
-        printf("%s\n", field_start);
-
-        field_start = field_end ? field_end + 1 : NULL;
+        pair = strtok_r(NULL, "&", &saveptr1);
     }
+
+    printf("table: %s\naction: %s\n", data->tbl, data->action);
+
+    send_to_database(db, data);
+
+    // Cleanup
+    for (int i = 0; i < data->length; i++) {
+        free(data->colData[i].col);
+        free(data->colData[i].data);
+    }
+    free(data->colData);
+    free(data->tbl);
+    free(data->action);
     free(data);
+    free(input);
 }
 
-void handle_post_request(int client_fd, const char* body, const char* url) {
+
+void handle_post_request(int client_fd, const char* body, const char* url, sqlite3* db) {
     if (body) {
-        process_form_data((char*)body);
+        process_form_data((char*)body, db);
     }
 
     char response[1024];
@@ -242,6 +322,11 @@ void* handle_client(void* arg) {
     free(arg);
 
     lua_State* L = init_lua();
+
+    sqlite3 * db;
+    if (sqlite3_open(DATABASE, &db)){
+        fprintf(stderr, "Can't open DB: %s\n", sqlite3_errmsg(db));
+    }
 
     char buffer[2048] = {0};
     ssize_t bytes_received = read(client_fd, buffer, sizeof(buffer) - 1);
@@ -261,7 +346,7 @@ void* handle_client(void* arg) {
         printf("%s\n", buffer);
         if (body) {
             body += 4;
-            handle_post_request(client_fd, body, url);
+            handle_post_request(client_fd, body, url, db);
         }
     } else {
         answer_to_connection(client_fd, url, method);
